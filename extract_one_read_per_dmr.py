@@ -4,6 +4,7 @@ import pysam
 import random
 import numpy as np
 import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from Bio.SeqRecord import SeqRecord
 from Bio import SeqIO
@@ -14,23 +15,41 @@ from Bio import SeqIO
 @click.option('--threads', default=4, help='Number of threads to use for processing')
 @click.option('--read_selection', type=click.Choice(['longest', 'shortest', 'random']), default='longest',
               help='Strategy for selecting reads at max coverage positions')
-def main(samplesheet, bed, threads, read_selection):
+@click.option('--bam_column', default='bam', help='Column name in samplesheet that contains BAM file paths')
+@click.option('--output_dir', default='output', help='Output directory')
+def main(samplesheet, bed, threads, read_selection, bam_column, output_dir):
     """
     Process a CSV sample sheet and a BED file of DMR regions.
     For each DMR region:
     1. Calculate average coverage across all samples and find the position with maximum average coverage
     2. For each sample, select a read (longest/shortest/random) covering that position
     3. Output FASTA files with the selected reads
-    
-    Run the process twice, once for regular BAM files and once for target BAM files.
     """
-    # Load the sample sheet (must contain columns: sample, label, bam, target_bam)
+    # Create output directory and subdirectories
+    subdirs = [
+        os.path.join(output_dir, "bam"),
+        os.path.join(output_dir, "fasta"),
+        os.path.join(output_dir, "fasta_pentabase"),
+        os.path.join(output_dir, "merged_bam"),
+        os.path.join(output_dir, "merged_bam_pentabase")
+    ]
+    
+    for directory in subdirs:
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+            click.echo(f"Created directory: {directory}")
+    
+    # Load the sample sheet (must contain columns: sample, label, and the specified bam_column)
     try:
         samples_df = pd.read_csv(samplesheet)
     except Exception as e:
         click.echo(f"Error reading samplesheet: {e}")
         return
 
+    # Create soft links and index BAM files
+    bam_dir = os.path.join(output_dir, "bam")
+    samples_df = setup_bam_files(samples_df, bam_dir, bam_column)
+    
     # Load the bed file (assuming at least three columns: chrom, start, end)
     try:
         # Read bed file with no header; if your file contains a header, consider using skiprows=1
@@ -48,53 +67,84 @@ def main(samplesheet, bed, threads, read_selection):
     dmr_df['start'] = dmr_df['start'].astype(int)
     dmr_df['end'] = dmr_df['end'].astype(int)
     
-    # Initialize BED file for maximum coverage positions
-    with open('max_cov_pos.bed', 'w') as bed_file:
-        bed_file.write('#chr\tstart\tend\tmax_pos\tmax_coverage\n')
+    # Initialize BED file for maximum coverage positions in output directory
+    max_cov_pos_path = os.path.join(output_dir, 'max_cov_pos.bed')
     
-    # Run the process for regular BAM files
-    click.echo("\n=== Processing regular BAM files ===")
-    process_bams(samples_df, dmr_df, threads, read_selection, is_target=False)
+    with open(max_cov_pos_path, 'w') as bed_file:
+        bed_file.write('#chr\tstart\tend\tname\n')
     
-    # Run the process for target BAM files
-    click.echo("\n=== Processing target BAM files ===")
-    process_bams(samples_df, dmr_df, threads, read_selection, is_target=True)
+    # Run the process
+    click.echo(f"\n=== Processing BAM files from column '{bam_column}' ===")
+    process_bams(samples_df, dmr_df, threads, read_selection, bam_column, output_dir)
 
-def process_bams(samples_df, dmr_df, threads, read_selection, is_target=False):
+def setup_bam_files(samples_df, bam_dir, bam_column):
     """
-    Run the complete process for either regular BAM files or target BAM files.
+    Create soft links to BAM files in the bam directory and index them.
+    Updates the DataFrame with new paths to the linked files.
+    """
+    new_df = samples_df.copy()
+    
+    for i, row in samples_df.iterrows():
+        # Process BAM file
+        if bam_column in row and pd.notna(row[bam_column]):
+            original_bam = row[bam_column]
+            filename = os.path.basename(original_bam)
+            linked_bam = os.path.join(bam_dir, filename)
+            
+            # Create soft link if it doesn't exist
+            if not os.path.exists(linked_bam):
+                try:
+                    os.symlink(os.path.abspath(original_bam), linked_bam)
+                    click.echo(f"Created soft link for {filename} in {bam_dir}")
+                except Exception as e:
+                    click.echo(f"Error creating soft link for {filename}: {e}")
+            
+            # Create index if it doesn't exist
+            if not os.path.exists(f"{linked_bam}.bai"):
+                try:
+                    subprocess.run(['samtools', 'index', linked_bam], check=True)
+                    click.echo(f"Created index for {filename}")
+                except Exception as e:
+                    click.echo(f"Error creating index for {filename}: {e}")
+            
+            # Update path in DataFrame
+            new_df.at[i, bam_column] = linked_bam
+    
+    return new_df
+
+def process_bams(samples_df, dmr_df, threads, read_selection, bam_column, output_dir):
+    """
+    Run the complete process for BAM files.
     
     Args:
         samples_df: DataFrame containing sample information
         dmr_df: DataFrame containing DMR regions
         threads: Number of threads to use
         read_selection: Strategy for selecting reads
-        is_target: Whether to process target_bam (True) or regular bam (False)
+        bam_column: Column name in samples_df containing BAM file paths
+        output_dir: Directory to store output files
     """
-    bam_column = 'target_bam' if is_target else 'bam'
-    target_suffix = '_target' if is_target else ''
-    
     click.echo(f"Step 1: Calculating average coverage for all DMRs across all samples using {bam_column}...")
     max_coverage_positions = calculate_max_average_coverage_positions(samples_df, dmr_df, threads, bam_column)
     
     # Write maximum coverage positions to BED file
-    write_max_coverage_bed(max_coverage_positions, target_suffix)
+    write_max_coverage_bed(max_coverage_positions, output_dir)
     
     click.echo(f"Step 2: Filtering DMRs and selecting reads for each sample from {bam_column}...")
     valid_dmrs_with_reads = select_reads_for_all_samples(samples_df, max_coverage_positions, read_selection, threads, bam_column)
     
     if valid_dmrs_with_reads:
-        click.echo(f"Step 3: Writing FASTA files with {target_suffix} suffix...")
-        write_fasta_files(valid_dmrs_with_reads, read_selection, target_suffix)
+        click.echo(f"Step 3: Writing FASTA files...")
+        write_fasta_files(valid_dmrs_with_reads, read_selection, output_dir)
         
         click.echo(f"Step 4: Creating merged BAM files by label...")
-        create_merged_bam_by_label(samples_df, valid_dmrs_with_reads, read_selection, target_suffix)
+        create_merged_bam_by_label(samples_df, valid_dmrs_with_reads, read_selection, bam_column, output_dir)
         
         click.echo(f"Process completed successfully. Selected {len(valid_dmrs_with_reads)} valid DMRs for {bam_column}.")
     else:
         click.echo(f"No valid DMRs found where all samples have reads covering the max coverage positions in {bam_column}.")
 
-def calculate_max_average_coverage_positions(samples_df, dmr_df, threads, bam_column='bam'):
+def calculate_max_average_coverage_positions(samples_df, dmr_df, threads, bam_column):
     """
     For each DMR, calculate the average coverage across all samples and find the position
     with maximum average coverage.
@@ -150,18 +200,24 @@ def calculate_max_average_coverage_positions(samples_df, dmr_df, threads, bam_co
     
     return dmr_coverage_data
 
-def write_max_coverage_bed(max_coverage_positions, target_suffix=''):
+def write_max_coverage_bed(max_coverage_positions, output_dir):
     """
     Write the maximum coverage positions to a BED file.
-    Appends to the existing max_cov_pos.bed file.
+    Creates a file in the output directory.
     """
     try:
-        with open('max_cov_pos.bed', 'a') as bed_file:
+        # Determine the file path
+        bed_file_path = os.path.join(output_dir, "max_cov_pos.bed")
+        
+        with open(bed_file_path, 'a') as bed_file:
             for dmr_idx, (chrom, start, end, max_pos, max_coverage) in max_coverage_positions.items():
-                bed_file.write(f"{chrom}\t{start}\t{end}\t{max_pos}\t{max_coverage:.2f}{target_suffix}\n")
-        click.echo(f"Added {len(max_coverage_positions)} regions to max_cov_pos.bed")
+                # Format: chrom, max_pos, max_pos+1, name
+                name = f"DMR,{chrom}:{start}-{end},max_coverage:{max_coverage:.2f}"
+                bed_file.write(f"{chrom}\t{max_pos}\t{max_pos+1}\t{name}\n")
+                
+        click.echo(f"Added {len(max_coverage_positions)} regions to {bed_file_path}")
     except Exception as e:
-        click.echo(f"Error writing max_cov_pos.bed: {e}")
+        click.echo(f"Error writing max coverage positions to {bed_file_path}: {e}")
 
 def get_coverage_for_region(bam_path, chrom, start, end, sample_index):
     """
@@ -170,8 +226,8 @@ def get_coverage_for_region(bam_path, chrom, start, end, sample_index):
     """
     try:
         bamfile = pysam.AlignmentFile(bam_path, "rb")
-        # Get coverage for all bases in the region
-        coverage_tuple = bamfile.count_coverage(chrom, start, end)
+        # Get coverage for all bases in the region, with quality_threshold=0 to handle "*" in basequality
+        coverage_tuple = bamfile.count_coverage(chrom, start, end, quality_threshold=0)
         bamfile.close()
         
         # Sum coverage across all bases (A, C, G, T)
@@ -224,10 +280,6 @@ def select_reads_for_all_samples(samples_df, max_coverage_positions, read_select
         
         # Check if all samples have reads for this DMR
         if len(all_sample_reads) == valid_sample_count:
-            # Update read descriptions with DMR index and coordinates
-            for sample_key, (record, _) in all_sample_reads.items():
-                record.description = f"dmr_index:{dmr_index},dmr_coordiante:{chrom}:{start}-{end},seq_mapping:{chrom}:{record.annotations['seq_start']}-{record.annotations['seq_end']}"
-            
             valid_dmrs_with_reads[dmr_index] = (chrom, start, end, all_sample_reads)
     
     return valid_dmrs_with_reads
@@ -287,13 +339,16 @@ def get_reads_at_position(sample, label, bam_path, chrom, position, read_selecti
         click.echo(f"Error getting reads from {bam_path} at position {chrom}:{position}: {e}")
         return None
 
-def write_fasta_files(valid_dmrs_with_reads, read_selection, target_suffix=''):
+def write_fasta_files(valid_dmrs_with_reads, read_selection, output_dir):
     """
     Write the selected reads to FASTA files, one file per sample.
-    The files will be named according to the specified convention.
+    The files will be placed in the output_dir/fasta directory.
     """
     # Group reads by sample
     sample_reads = {}
+    
+    # Create fasta directory path
+    fasta_dir = os.path.join(output_dir, "fasta")
     
     # Renumber DMRs after filtering
     dmr_renumbering = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted(valid_dmrs_with_reads.keys()))}
@@ -306,8 +361,12 @@ def write_fasta_files(valid_dmrs_with_reads, read_selection, target_suffix=''):
             if sample_key not in sample_reads:
                 sample_reads[sample_key] = []
             
-            # Update description with the new DMR index and seq_mapping information
-            record.description = f"dmr_index:{new_dmr_idx},dmr_coordiante:{chrom}:{start}-{end},seq_mapping:{chrom}:{record.annotations['seq_start']}-{record.annotations['seq_end']}"
+            # Split the sample_key to get the sample name
+            parts = sample_key.split('_')
+            sample = parts[0]
+            
+            # Update description with the new DMR index, seq_mapping information, and read_name
+            record.description = f"dmr_index:{new_dmr_idx},dmr_coordiante:{chrom}:{start}-{end},seq_mapping:{chrom}:{record.annotations['seq_start']}-{record.annotations['seq_end']},read_name:{sample}_{record.id}"
             sample_reads[sample_key].append(record)
     
     # Write FASTA files for each sample
@@ -316,8 +375,8 @@ def write_fasta_files(valid_dmrs_with_reads, read_selection, target_suffix=''):
         sample = parts[0]
         label = parts[1]
         
-        # Create the output filename with target suffix if needed
-        out_filename = f"{sample}_{label}{target_suffix}_{read_selection}.fa"
+        # Create the output filename
+        out_filename = os.path.join(fasta_dir, f"{sample}_{label}_{read_selection}.fa")
         
         # Write the FASTA file
         try:
@@ -327,11 +386,15 @@ def write_fasta_files(valid_dmrs_with_reads, read_selection, target_suffix=''):
         except Exception as e:
             click.echo(f"Error writing output {out_filename}: {e}")
 
-def create_merged_bam_by_label(samples_df, valid_dmrs_with_reads, read_selection, target_suffix=''):
+def create_merged_bam_by_label(samples_df, valid_dmrs_with_reads, read_selection, bam_column, output_dir):
     """
     Create merged BAM files for each label, containing all reads from samples with that label.
     Reads are renamed with sample prefix, and output BAMs are sorted and indexed.
+    All output files are placed in the output_dir/merged_bam directory.
     """
+    # Create merged_bam directory path
+    merged_bam_dir = os.path.join(output_dir, "merged_bam")
+    
     # Group reads by label
     label_reads = {}
     label_header = {}
@@ -362,7 +425,6 @@ def create_merged_bam_by_label(samples_df, valid_dmrs_with_reads, read_selection
                 # Find the sample's BAM file to get the header
                 for _, row in samples_df.iterrows():
                     if row['label'] == label:
-                        bam_column = 'target_bam' if target_suffix == '_target' else 'bam'
                         if bam_column in row and pd.notna(row[bam_column]):
                             bam_path = row[bam_column]
                             try:
@@ -377,8 +439,8 @@ def create_merged_bam_by_label(samples_df, valid_dmrs_with_reads, read_selection
     for label, reads in label_reads.items():
         if reads and label_header[label]:
             # Create unsorted BAM first
-            out_filename = f"{label}{target_suffix}_{read_selection}.bam"
-            sorted_filename = f"{label}{target_suffix}_{read_selection}.sorted.bam"
+            out_filename = os.path.join(merged_bam_dir, f"{label}_{read_selection}.bam")
+            sorted_filename = os.path.join(merged_bam_dir, f"{label}_{read_selection}.sorted.bam")
             
             try:
                 # Create a BAM file with the collected reads
@@ -400,17 +462,185 @@ def create_merged_bam_by_label(samples_df, valid_dmrs_with_reads, read_selection
                 pysam.index(sorted_filename)
                 click.echo(f"Indexed sorted BAM file {sorted_filename}")
                 
-                # Run pentabase_conv
-                bam_prefix = f"{label}{target_suffix}_{read_selection}"
-                cmd = f"bash ./pentabase_conv --bam-file {sorted_filename} --ref-file hg38_only_chromsomes.fa --output-bed {bam_prefix}.bed.gz"
+                # Run pentabase_conv with outputs in the output directory
+                bam_prefix = os.path.join(output_dir, f"{label}_{read_selection}")
+                bed_gz_path = f"{bam_prefix}.bed.gz"
+                cmd = f"bash ./pentabase_conv --bam-file {sorted_filename} --ref-file hg38_only_chromsomes.fa --output-bed {bed_gz_path}"
                 try:
                     os.system(cmd)
                     click.echo(f"Ran pentabase_conv on {sorted_filename}")
+                    
+                    # Process the pentabase bed.gz output to create new files with modified sequences
+                    process_pentabase_output(bed_gz_path, sorted_filename, label, read_selection, output_dir)
+                    
                 except Exception as e:
                     click.echo(f"Error running pentabase_conv on {sorted_filename}: {e}")
                 
             except Exception as e:
                 click.echo(f"Error processing BAM file {out_filename}: {e}")
+
+def process_pentabase_output(bed_gz_path, bam_path, label, read_selection, output_dir):
+    """
+    Process the pentabase_conv output file to replace sequences in FASTA and BAM files.
+    
+    Args:
+        bed_gz_path: Path to the bed.gz file produced by pentabase_conv
+        bam_path: Path to the BAM file that was used for pentabase_conv
+        label: Label for the current group
+        read_selection: Strategy used for selecting reads
+        output_dir: Directory to store output files
+    """
+    try:
+        click.echo(f"Processing pentabase output from {bed_gz_path}")
+        
+        # Maps to store read name to new sequence mappings
+        read_to_sequence = {}
+        
+        # Parse the bed.gz file to extract read names and new sequences
+        import gzip
+        
+        # Check if the file exists
+        if not os.path.exists(bed_gz_path):
+            click.echo(f"Warning: Pentabase output file {bed_gz_path} does not exist. Skipping processing.")
+            return
+        
+        # Open the gzipped bed file and read the contents
+        with gzip.open(bed_gz_path, 'rt') as bed_file:
+            for line in bed_file:
+                if line.startswith('#'):
+                    continue
+                
+                # Split the line into columns
+                cols = line.strip().split('\t')
+                if len(cols) >= 7:
+                    read_name = cols[3]
+                    new_sequence = cols[6]
+                    
+                    # Store the mapping
+                    read_to_sequence[read_name] = new_sequence
+        
+        click.echo(f"Extracted {len(read_to_sequence)} read-to-sequence mappings from {bed_gz_path}")
+        
+        # Create new FASTA files with pentabase sequences
+        create_pentabase_fasta_files(read_to_sequence, label, read_selection, output_dir)
+        
+        # Create new BAM files with pentabase sequences
+        create_pentabase_bam_file(read_to_sequence, bam_path, label, read_selection, output_dir)
+        
+    except Exception as e:
+        click.echo(f"Error processing pentabase output: {e}")
+
+def create_pentabase_fasta_files(read_to_sequence, label, read_selection, output_dir):
+    """
+    Create new FASTA files with sequences replaced by pentabase sequences.
+    
+    Args:
+        read_to_sequence: Dictionary mapping read names to new sequences
+        label: Label for the current group
+        read_selection: Strategy used for selecting reads
+        output_dir: Directory to store output files
+    """
+    try:
+        # Define input and output directories
+        fasta_dir = os.path.join(output_dir, "fasta")
+        fasta_pentabase_dir = os.path.join(output_dir, "fasta_pentabase")
+        
+        # Find all FASTA files in the fasta directory that match the pattern
+        fasta_pattern = os.path.join(fasta_dir, f"*_{label}_{read_selection}.fa")
+        import glob
+        
+        for fasta_path in glob.glob(fasta_pattern):
+            # Create a new filename in the pentabase directory
+            base_name = os.path.basename(fasta_path)
+            base_name_no_ext = os.path.splitext(base_name)[0]
+            pentabase_fasta_path = os.path.join(fasta_pentabase_dir, f"{base_name_no_ext}_pentabase.fa")
+            
+            # Read the original FASTA file
+            records = []
+            for record in SeqIO.parse(fasta_path, "fasta"):
+                # Extract the original read name from the description
+                description_parts = record.description.split(',')
+                read_name = None
+                for part in description_parts:
+                    if part.startswith("read_name:"):
+                        read_name = part.split(':', 1)[1]
+                        break
+                
+                if read_name and read_name in read_to_sequence:
+                    # Create a new record with the pentabase sequence
+                    from Bio.Seq import Seq
+                    new_record = record
+                    new_record.seq = Seq(read_to_sequence[read_name])
+                    records.append(new_record)
+                else:
+                    # Keep the original record if no replacement found
+                    records.append(record)
+            
+            # Write the new FASTA file
+            with open(pentabase_fasta_path, "w") as f_out:
+                SeqIO.write(records, f_out, "fasta")
+            
+            click.echo(f"Written pentabase FASTA file {pentabase_fasta_path} with {len(records)} reads")
+    
+    except Exception as e:
+        click.echo(f"Error creating pentabase FASTA files: {e}")
+
+def create_pentabase_bam_file(read_to_sequence, bam_path, label, read_selection, output_dir):
+    """
+    Create a new BAM file with sequences replaced by pentabase sequences.
+    
+    Args:
+        read_to_sequence: Dictionary mapping read names to new sequences
+        bam_path: Path to the original BAM file
+        label: Label for the current group
+        read_selection: Strategy used for selecting reads
+        output_dir: Directory to store output files
+    """
+    try:
+        # Define input and output directories
+        merged_bam_pentabase_dir = os.path.join(output_dir, "merged_bam_pentabase")
+        
+        # Create a new filename in the pentabase BAM directory
+        base_name = os.path.basename(bam_path)
+        base_name_no_ext = os.path.splitext(base_name)[0]
+        pentabase_bam_path = os.path.join(merged_bam_pentabase_dir, f"{base_name_no_ext}_pentabase.bam")
+        
+        # Open the original BAM file
+        with pysam.AlignmentFile(bam_path, "rb") as input_bam:
+            # Create a new BAM file with the same header
+            with pysam.AlignmentFile(pentabase_bam_path, "wb", header=input_bam.header) as output_bam:
+                # Process each read in the input BAM
+                for read in input_bam:
+                    read_name = read.query_name
+                    if read_name in read_to_sequence:
+                        # Replace the sequence with the pentabase sequence
+                        new_sequence = read_to_sequence[read_name]
+                        
+                        # Create a copy of the read
+                        read.query_sequence = new_sequence
+                        
+                        # Adjust qualities if necessary
+                        if read.query_qualities is not None and len(read.query_qualities) != len(new_sequence):
+                            # Set qualities to a default value (30 is a good quality score)
+                            read.query_qualities = pysam.array.array('B', [30] * len(new_sequence))
+                    
+                    # Write the read to the output BAM
+                    output_bam.write(read)
+        
+        # Sort and index the new BAM file
+        sorted_pentabase_bam_path = os.path.join(merged_bam_pentabase_dir, f"{base_name_no_ext}_pentabase.sorted.bam")
+        pysam.sort("-o", sorted_pentabase_bam_path, pentabase_bam_path)
+        
+        # Remove the unsorted BAM
+        os.remove(pentabase_bam_path)
+        
+        # Index the sorted BAM file
+        pysam.index(sorted_pentabase_bam_path)
+        
+        click.echo(f"Created pentabase BAM file: {sorted_pentabase_bam_path}")
+    
+    except Exception as e:
+        click.echo(f"Error creating pentabase BAM file: {e}")
 
 if __name__ == '__main__':
     main()

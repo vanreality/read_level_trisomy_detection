@@ -1,3 +1,5 @@
 archive/
 data/
 output/
+results/
+.DS_Store

@@ -22,12 +22,13 @@ logger = logging.getLogger(__name__)
 @click.command()
 @click.option('--input', required=True, type=str, help='Input parquet file path')
 @click.option('--output', required=True, type=str, help='Output directory')
+@click.option('--sample_col', default='sample', type=str, help='Output directory')
 @click.option('--ncpus', default=1, type=int, help='Number of CPUs for parallel processing')
 @click.option('--labels_to_keep', required=True, multiple=True, help='Labels to keep, e.g., Normal T16')
 @click.option('--threshold', default=0.0, type=float, help='Threshold for prob_class_1 column')
 @click.option('--mode', type=click.Choice(['random', 'first']), required=True, help='Read extraction mode')
 @click.option('--max_pos', type=str, help='Path to pre-computed max_positions bed file for resuming')
-def main(input, output, ncpus, labels_to_keep, threshold, mode, max_pos):
+def main(input, output, sample_col, ncpus, labels_to_keep, threshold, mode, max_pos):
     """Extract reads from parquet file based on DMR regions."""
     # Create output directory if it doesn't exist
     os.makedirs(output, exist_ok=True)
@@ -74,7 +75,7 @@ def main(input, output, ncpus, labels_to_keep, threshold, mode, max_pos):
         df = load_and_filter_dataframe(input, labels_to_keep, threshold, ncpus)
     
     # Extract reads with parallel processing and improved memory efficiency
-    extracted_reads = extract_reads_parallel_memory_efficient(df, max_positions, mode, ncpus)
+    extracted_reads = extract_reads_parallel_memory_efficient(df, max_positions, mode, ncpus, sample_col)
     total_reads = sum(len(reads) for reads in extracted_reads.values())
     logger.info(f"Extracted {total_reads} reads for {len(extracted_reads)} sample-label combinations")
     
@@ -244,7 +245,7 @@ def find_max_coverage_positions(df, coverage_dict):
     
     return max_positions
 
-def extract_reads_parallel_memory_efficient(df, max_positions, mode, ncpus):
+def extract_reads_parallel_memory_efficient(df, max_positions, mode, ncpus, sample_col):
     """
     Extract reads for each sample at maximum coverage positions, with improved memory efficiency.
     
@@ -305,7 +306,7 @@ def extract_reads_parallel_memory_efficient(df, max_positions, mode, ncpus):
                 ]
                 
                 # Group by sample
-                for sample, sample_df in covering_reads.groupby('sampledown'):
+                for sample, sample_df in covering_reads.groupby(sample_col):
                     for label, label_df in sample_df.groupby('label'):
                         if len(label_df) == 0:
                             continue

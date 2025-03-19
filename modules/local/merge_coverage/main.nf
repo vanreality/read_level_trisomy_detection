@@ -13,7 +13,7 @@ process MERGE_COVERAGE {
     def coverage_files_str = coverage_files.join(' ')
     """
     python3 ${script} \\
-        --input ${coverage_files_str} \\
+        --input "${coverage_files_str}" \\
         ${args}
     """
 }

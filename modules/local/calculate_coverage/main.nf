@@ -13,6 +13,7 @@ process CALCULATE_COVERAGE {
     """
     python3 ${script} \\
         --input ${parquet_file} \\
+        --ncpus ${task.cpus} \\
         ${args}
     """
 }

@@ -57,13 +57,21 @@ workflow  {
             .set { ch_max_coverage_file }
     }
     
+    ch_parquet_samplesheet
+        .map { meta, parquetFile ->
+            def methFile = file("${params.meth_dir}/${meta.id}_cpg_prob.csv")
+            if (!methFile.exists()) {
+                error "Methylation file not found: ${methFile}"
+            }
+            return [meta, parquetFile, methFile]
+        }
+        .set { ch_samplesheet }
+
     // 4. Extract reads from parquet
     EXTRACT_READ_FROM_PARQUET(
-        ch_parquet_samplesheet,
+        ch_samplesheet,
         ch_max_coverage_file,
         params.mode,
         file("${workflow.projectDir}/bin/extract_read_from_parquet.py")
     )
-
-    // 5. Run compare script
 }

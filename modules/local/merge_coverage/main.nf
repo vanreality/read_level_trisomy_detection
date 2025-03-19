@@ -6,13 +6,14 @@ process MERGE_COVERAGE {
     path(script)
     
     output:
-    tuple val(meta), path("merged_coverage.csv"), emit: merged_coverage
+    tuple val(meta), path("max_cov_pos.csv"), emit: merged_coverage
     
     script:
     def args = task.ext.args ?: ''
+    def coverage_files_str = coverage_files.join(' ')
     """
     python3 ${script} \\
-        --input ${coverage_files} \\
+        --input ${coverage_files_str} \\
         ${args}
     """
 }

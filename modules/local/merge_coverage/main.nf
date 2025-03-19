@@ -10,10 +10,10 @@ process MERGE_COVERAGE {
     
     script:
     def args = task.ext.args ?: ''
-    def coverage_files_str = coverage_files.join(' ')
+    def coverage_files_args = coverage_files.collect { "--input '$it'" }.join(' ')
     """
     python3 ${script} \\
-        --input "${coverage_files_str}" \\
+        ${coverage_files_args} \\
         ${args}
     """
 }

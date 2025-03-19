@@ -194,13 +194,23 @@ def main(input, output, verbose):
     start_time = time.time()
     
     try:
-        # Expand wildcards if any
+        # Expand wildcards if any and handle space-separated filenames
         input_files = []
         for pattern in input:
-            matched_files = glob.glob(pattern)
-            if not matched_files:
-                console.print(f"[bold yellow]Warning:[/bold yellow] No files match pattern '{pattern}'", style="yellow")
-            input_files.extend(matched_files)
+            # Check if the pattern contains spaces (multiple filenames in one argument)
+            if ' ' in pattern:
+                # Split by space and check if each individual file exists
+                for file_path in pattern.split():
+                    if os.path.exists(file_path):
+                        input_files.append(file_path)
+                    else:
+                        console.print(f"[bold yellow]Warning:[/bold yellow] File '{file_path}' does not exist", style="yellow")
+            else:
+                # Handle patterns with wildcards
+                matched_files = glob.glob(pattern)
+                if not matched_files:
+                    console.print(f"[bold yellow]Warning:[/bold yellow] No files match pattern '{pattern}'", style="yellow")
+                input_files.extend(matched_files)
         
         if not input_files:
             raise ValueError("No input files found")

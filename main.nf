@@ -5,26 +5,44 @@ include { MERGE_COVERAGE } from './modules/local/merge_coverage/main'
 include { EXTRACT_READ_FROM_PARQUET } from './modules/local/extract_read_from_parquet/main'
 
 workflow  {
-    // 1. Split parquet by sample
-    SPLIT_PARQUET_BY_SAMPLE(
-            [[id: "sample"], file(params.input_parquet)],
-            file("${workflow.projectDir}/bin/split_parquet_by_sample.py")
-    )
-
-    // Parse the generated samplesheet CSV to create channel
-    SPLIT_PARQUET_BY_SAMPLE.out.samplesheet
-        .map { meta, samplesheet -> samplesheet }
-        .splitCsv(header: true)
-        .map { row -> 
-            def meta = [id: row.sample, label: row.label]
-            // Check if parquet file exists
-            def parquetFile = file(row.parquet)
-            if (!parquetFile.exists()) {
-                error "Parquet file not found: ${row.parquet}"
+    // Define the channel for downstream processing
+    if (params.input_parquet_samplesheet) {
+        // Skip SPLIT_PARQUET_BY_SAMPLE and use provided samplesheet directly
+        Channel
+            .fromPath(params.input_parquet_samplesheet)
+            .splitCsv(header: true)
+            .map { row -> 
+                def meta = [id: row.sample, label: row.label]
+                // Check if parquet file exists
+                def parquetFile = file(row.parquet)
+                if (!parquetFile.exists()) {
+                    error "Parquet file not found: ${row.parquet}"
+                }
+                return [meta, parquetFile]
             }
-            return [meta, parquetFile]
-        }
-        .set { ch_parquet_samplesheet }
+            .set { ch_parquet_samplesheet }
+    } else {
+        // 1. Split parquet by sample
+        SPLIT_PARQUET_BY_SAMPLE(
+                [[id: "sample"], file(params.input_parquet)],
+                file("${workflow.projectDir}/bin/split_parquet_by_sample.py")
+        )
+
+        // Parse the generated samplesheet CSV to create channel
+        SPLIT_PARQUET_BY_SAMPLE.out.samplesheet
+            .map { meta, samplesheet -> samplesheet }
+            .splitCsv(header: true)
+            .map { row -> 
+                def meta = [id: row.sample, label: row.label]
+                // Check if parquet file exists
+                def parquetFile = file(row.parquet)
+                if (!parquetFile.exists()) {
+                    error "Parquet file not found: ${row.parquet}"
+                }
+                return [meta, parquetFile]
+            }
+            .set { ch_parquet_samplesheet }
+    }
     
     // Determine if we should use provided max_coverage_file or generate one
     if (params.max_coverage_file) {

@@ -76,29 +76,107 @@ def read_methylation_file(methylation_file):
         console.print(f"[bold red]Error reading methylation file:[/bold red] {str(e)}", style="red")
         raise
 
-def calculate_methylation_stats(methylation_df, dmr):
+def prefilter_methylation_data(methylation_df, max_coverage_df):
+    """
+    Prefilter methylation data for each DMR.
+    
+    Args:
+        methylation_df (pd.DataFrame): Complete methylation data
+        max_coverage_df (pd.DataFrame): Max coverage data with DMR information
+        
+    Returns:
+        dict: Dictionary mapping DMR indices to filtered methylation data
+    """
+    dmr_methylation_dict = {}
+    
+    for _, dmr_row in tqdm(max_coverage_df.iterrows(), total=len(max_coverage_df), 
+                           desc="Prefiltering methylation data", unit="DMR"):
+        dmr_index = dmr_row['dmr_index']
+        chr_dmr = dmr_row['chr_dmr']
+        start_dmr = dmr_row['start_dmr']
+        end_dmr = dmr_row['end_dmr']
+        
+        # Filter methylation data for this DMR
+        dmr_methylation = methylation_df[
+            (methylation_df['chr'] == chr_dmr) & 
+            (methylation_df['start'] >= start_dmr) & 
+            (methylation_df['end'] <= end_dmr)
+        ]
+        
+        dmr_methylation_dict[dmr_index] = dmr_methylation
+    
+    return dmr_methylation_dict
+
+def read_and_prefilter_parquet(parquet_file, max_coverage_df, chunk_size=1000000):
+    """
+    Read parquet file once and prefilter data for each DMR.
+    
+    Args:
+        parquet_file (str): Path to the parquet file
+        max_coverage_df (pd.DataFrame): Max coverage data with DMR information
+        chunk_size (int): Size of chunks to read from parquet file
+        
+    Returns:
+        dict: Dictionary mapping DMR indices to filtered read data
+    """
+    # Create a dictionary to store reads by DMR
+    dmr_reads_dict = defaultdict(list)
+    
+    # Get table metadata to check total rows
+    parquet_metadata = pq.read_metadata(parquet_file)
+    total_rows = parquet_metadata.num_rows
+    
+    console.print(f"[bold blue]Reading parquet file with [/bold blue]{total_rows:,}[bold blue] rows in chunks...[/bold blue]")
+    
+    # Read the parquet file in chunks to avoid memory issues
+    reader = pq.ParquetFile(parquet_file)
+    
+    for i, batch in enumerate(tqdm(reader.iter_batches(batch_size=chunk_size), 
+                                   total=(total_rows + chunk_size - 1) // chunk_size,
+                                   desc="Processing parquet chunks", unit="chunk")):
+        # Convert batch to DataFrame
+        chunk_df = batch.to_pandas()
+        
+        # Process each DMR in the max coverage file
+        for _, dmr_row in max_coverage_df.iterrows():
+            dmr_index = dmr_row['dmr_index']
+            chr_val = dmr_row['chr']
+            pos = dmr_row['pos']
+            
+            # Filter reads that cover this position
+            filtered_reads = chunk_df[
+                (chunk_df['chr'] == chr_val) &
+                (chunk_df['start'] <= pos) &
+                (chunk_df['end'] >= pos)
+            ]
+            
+            if not filtered_reads.empty:
+                dmr_reads_dict[dmr_index].append(filtered_reads)
+    
+    # Concatenate DataFrames for each DMR
+    for dmr_index in dmr_reads_dict:
+        if dmr_reads_dict[dmr_index]:
+            dmr_reads_dict[dmr_index] = pd.concat(dmr_reads_dict[dmr_index], ignore_index=True)
+        else:
+            dmr_reads_dict[dmr_index] = pd.DataFrame()
+    
+    return dmr_reads_dict
+
+def calculate_methylation_stats(filtered_methylation_df):
     """
     Calculate methylation statistics for CpG sites within a DMR.
     
     Args:
-        methylation_df (pd.DataFrame): DataFrame containing methylation data
-        dmr (dict): DMR information including coordinates
+        filtered_methylation_df (pd.DataFrame): Pre-filtered methylation data for a DMR
         
     Returns:
         tuple: (raw_methylation_list, prob_weighted_methylation_list)
     """
-    # Filter methylation data for the current DMR
-    dmr_methylation = methylation_df[
-        (methylation_df['chr'] == dmr['chr_dmr']) & 
-        (methylation_df['start'] >= dmr['start_dmr']) & 
-        (methylation_df['end'] <= dmr['end_dmr'])
-    ]
-    
-    if dmr_methylation.empty:
+    if filtered_methylation_df.empty:
         return [], []
     
     # Group by CpG site coordinates
-    grouped = dmr_methylation.groupby(['chr', 'start', 'end'])
+    grouped = filtered_methylation_df.groupby(['chr', 'start', 'end'])
     
     raw_methylation_list = []
     prob_weighted_methylation_list = []
@@ -118,20 +196,20 @@ def calculate_methylation_stats(methylation_df, dmr):
     
     return raw_methylation_list, prob_weighted_methylation_list
 
-def process_dmr(dmr_row, parquet_file, methylation_df, mode):
+def process_dmr(dmr_data, mode):
     """
     Process a single DMR to select and extract a read.
     
     Args:
-        dmr_row (pd.Series): Row from max coverage file for a single DMR
-        parquet_file (str): Path to the parquet file
-        methylation_df (pd.DataFrame): Methylation data
+        dmr_data (tuple): (dmr_row, filtered_reads_df, filtered_methylation_df)
         mode (str): Selection mode ('longest' or 'prob_largest')
         
     Returns:
         tuple: (dmr_index, read_data, methylation_stats) or None if no suitable read found
     """
     try:
+        dmr_row, filtered_reads_df, filtered_methylation_df = dmr_data
+        
         # Extract DMR information
         dmr = {
             'chr': dmr_row['chr'],
@@ -142,38 +220,27 @@ def process_dmr(dmr_row, parquet_file, methylation_df, mode):
             'end_dmr': dmr_row['end_dmr']
         }
         
-        # Read parquet data for this specific region
-        table = pq.read_table(
-            parquet_file,
-            filters=[
-                ('chr', '=', dmr['chr']),
-                ('start', '<=', dmr['pos']),
-                ('end', '>=', dmr['pos'])
-            ]
-        )
-        reads_df = table.to_pandas()
-        
-        if reads_df.empty:
+        if filtered_reads_df.empty:
             return None
         
         # Select the best read based on the specified mode
         if mode == 'longest':
             # Add length column based on sequence length
-            reads_df['length'] = reads_df['seq'].str.len()
+            filtered_reads_df['length'] = filtered_reads_df['seq'].str.len()
             # Sort by length (descending) and take the first read
-            reads_df = reads_df.sort_values('length', ascending=False)
+            filtered_reads_df = filtered_reads_df.sort_values('length', ascending=False)
         elif mode == 'prob_largest':
             # Sort by prob_class_1 (descending) and take the first read
-            reads_df = reads_df.sort_values('prob_class_1', ascending=False)
+            filtered_reads_df = filtered_reads_df.sort_values('prob_class_1', ascending=False)
         else:
             raise ValueError(f"Unknown mode: {mode}")
         
         # Get the best read
-        if not reads_df.empty:
-            best_read = reads_df.iloc[0]
+        if not filtered_reads_df.empty:
+            best_read = filtered_reads_df.iloc[0]
             
             # Calculate methylation statistics for this DMR
-            raw_meth, prob_meth = calculate_methylation_stats(methylation_df, dmr)
+            raw_meth, prob_meth = calculate_methylation_stats(filtered_methylation_df)
             
             return {
                 'dmr_index': dmr['dmr_index'],
@@ -197,35 +264,40 @@ def process_dmr(dmr_row, parquet_file, methylation_df, mode):
         console.print(f"[bold red]Error processing DMR {dmr_row['dmr_index']}:[/bold red] {str(e)}", style="red")
         return None
 
-def extract_reads_parallel(max_coverage_df, parquet_file, methylation_df, mode, num_processes):
+def extract_reads_parallel(max_coverage_df, dmr_reads_dict, dmr_methylation_dict, mode, num_processes):
     """
-    Extract reads from the parquet file based on max coverage positions using parallel processing.
+    Extract reads using parallel processing with pre-filtered data.
     
     Args:
         max_coverage_df (pd.DataFrame): DataFrame with max coverage positions
-        parquet_file (str): Path to the parquet file
-        methylation_df (pd.DataFrame): DataFrame with methylation data
+        dmr_reads_dict (dict): Dictionary mapping DMR indices to filtered read data
+        dmr_methylation_dict (dict): Dictionary mapping DMR indices to filtered methylation data
         mode (str): Selection mode ('longest' or 'prob_largest')
         num_processes (int): Number of processes to use
         
     Returns:
         list: List of selected read data
     """
-    # Create a partial function with fixed parameters
-    process_func = partial(
-        process_dmr,
-        parquet_file=parquet_file,
-        methylation_df=methylation_df,
-        mode=mode
-    )
+    # Create process data list
+    process_data_list = []
+    
+    for _, dmr_row in max_coverage_df.iterrows():
+        dmr_index = dmr_row['dmr_index']
+        filtered_reads_df = dmr_reads_dict.get(dmr_index, pd.DataFrame())
+        filtered_methylation_df = dmr_methylation_dict.get(dmr_index, pd.DataFrame())
+        
+        process_data_list.append((dmr_row, filtered_reads_df, filtered_methylation_df))
     
     console.print(f"[bold blue]Extracting reads using [/bold blue]{num_processes}[bold blue] processes...[/bold blue]")
+    
+    # Create a partial function with fixed parameters
+    process_func = partial(process_dmr, mode=mode)
     
     # Use multiprocessing to process DMRs in parallel
     with mp.Pool(processes=num_processes) as pool:
         results = list(tqdm(
-            pool.imap(process_func, [row for _, row in max_coverage_df.iterrows()]),
-            total=len(max_coverage_df),
+            pool.imap(process_func, process_data_list),
+            total=len(process_data_list),
             desc="Processing DMRs",
             unit="DMR"
         ))
@@ -285,8 +357,9 @@ def write_fasta(selected_reads, output_file):
               help='Read selection mode: longest or prob_largest')
 @click.option('--prefix', required=True, help='Prefix for output files')
 @click.option('--ncpus', type=int, default=None, help='Number of processes to use (default: number of CPU cores)')
+@click.option('--chunk_size', type=int, default=1000000, help='Size of chunks to read from parquet file')
 @click.option('--verbose', is_flag=True, help='Print verbose output')
-def main(input, max_coverage, methylation, mode, prefix, ncpus, verbose):
+def main(input, max_coverage, methylation, mode, prefix, ncpus, chunk_size, verbose):
     """
     Extract reads from a parquet file based on maximum coverage positions.
     
@@ -330,6 +403,7 @@ def main(input, max_coverage, methylation, mode, prefix, ncpus, verbose):
             f"[bold green]Using max coverage positions from:[/bold green] {max_coverage}\n"
             f"[bold green]Using methylation data from:[/bold green] {methylation}\n"
             f"[bold green]Selection mode:[/bold green] {mode}\n"
+            f"[bold green]Chunk size:[/bold green] {chunk_size:,}\n"
             f"[bold green]Output will be saved to:[/bold green] {output_file}",
             title="Read Extraction Parameters", 
             border_style="blue"
@@ -344,14 +418,27 @@ def main(input, max_coverage, methylation, mode, prefix, ncpus, verbose):
             console.print(f"[green]Found {len(max_coverage_df)} DMRs in max coverage file[/green]")
             console.print(f"[green]Found {len(methylation_df)} methylation records[/green]")
         
-        # Extract reads using parallel processing
+        # Prefilter methylation data for each DMR
+        dmr_methylation_dict = prefilter_methylation_data(methylation_df, max_coverage_df)
+        
+        # Free up memory after prefiltering
+        del methylation_df
+        
+        # Read and prefilter parquet data for each DMR
+        dmr_reads_dict = read_and_prefilter_parquet(input, max_coverage_df, chunk_size)
+        
+        # Extract reads using parallel processing with prefiltered data
         selected_reads = extract_reads_parallel(
             max_coverage_df,
-            input,
-            methylation_df,
+            dmr_reads_dict,
+            dmr_methylation_dict,
             mode,
             ncpus
         )
+        
+        # Free up memory before writing output
+        del dmr_reads_dict
+        del dmr_methylation_dict
         
         # Write selected reads to FASTA file
         console.print(f"[bold blue]Writing {len(selected_reads)} selected reads to[/bold blue] {output_file}")

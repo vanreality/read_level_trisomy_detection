@@ -15,7 +15,6 @@ import time
 import glob
 import multiprocessing as mp
 from functools import partial
-import itertools
 
 # Initialize console for rich output
 console = Console()
@@ -49,6 +48,9 @@ def read_single_file(file_path):
         
         # Add DMR key column
         df['dmr_key'] = df.apply(lambda row: f"{row['chr_dmr']}:{row['start_dmr']}-{row['end_dmr']}", axis=1)
+        
+        # Rename coverage column to include sample name
+        df = df.rename(columns={'coverage': f'coverage_{sample_name}'})
         
         return (sample_name, df)
         
@@ -89,194 +91,128 @@ def read_coverage_files_parallel(input_files, num_processes):
     
     return sample_dfs
 
-def create_dmr_key(row):
+def merge_sample_dataframes(sample_dfs):
     """
-    Create a unique key for each DMR using its coordinates.
-    
-    Args:
-        row (pd.Series): Row containing DMR information
-        
-    Returns:
-        str: Unique DMR key
-    """
-    return f"{row['chr_dmr']}:{row['start_dmr']}-{row['end_dmr']}"
-
-def preprocess_data_for_dmr_processing(sample_dfs):
-    """
-    Preprocess and reorganize data for efficient DMR processing.
+    Merge all sample DataFrames on position and DMR information.
     
     Args:
         sample_dfs (dict): Dictionary mapping sample names to DataFrames
         
     Returns:
-        tuple: (dmr_data_dict, common_dmrs, all_samples_count)
+        pd.DataFrame: Merged DataFrame with coverage columns for each sample
         
     Raises:
-        ValueError: If there are no common DMRs across all samples
+        ValueError: If merged DataFrame is empty
     """
-    console.print("[bold blue]Preprocessing data for efficient DMR processing...[/bold blue]")
+    console.print("[bold blue]Merging sample data...[/bold blue]")
     
-    # Find DMRs present in all samples
-    sample_dmrs = {sample: set(df['dmr_key'].unique()) for sample, df in sample_dfs.items()}
-    common_dmrs = set.intersection(*sample_dmrs.values()) if sample_dmrs else set()
+    # Get sample names
+    sample_names = list(sample_dfs.keys())
     
-    if not common_dmrs:
-        raise ValueError("No common DMRs found across all samples")
+    if not sample_names:
+        raise ValueError("No samples to merge")
     
-    console.print(f"[bold green]Found {len(common_dmrs)} common DMRs across all samples[/bold green]")
+    # Start with the first DataFrame
+    first_sample = sample_names[0]
+    merged_df = sample_dfs[first_sample]
     
-    # Preprocess data: Group by DMR key for each sample
-    dmr_data_dict = {}
+    # Define columns to keep during merges (exclude coverage from right dataframes)
+    merge_cols = ['chr', 'pos', 'chr_dmr', 'start_dmr', 'end_dmr', 'dmr_key']
     
-    # First pass: Create a dictionary to store position info per DMR
-    pos_info = {}
+    # Merge with each subsequent DataFrame
+    for sample in tqdm(sample_names[1:], desc="Merging samples"):
+        merged_df = pd.merge(
+            merged_df, 
+            sample_dfs[sample], 
+            on=merge_cols,
+            how='inner'  # Only keep positions present in all samples
+        )
     
-    console.print("[bold blue]Organizing data by DMR...[/bold blue]")
-    for sample, df in tqdm(sample_dfs.items(), desc="Preprocessing samples"):
-        # Filter to only common DMRs to reduce memory usage
-        df_filtered = df[df['dmr_key'].isin(common_dmrs)]
-        
-        # Group data by DMR key
-        for dmr_key, group in df_filtered.groupby('dmr_key'):
-            # Initialize dictionary for this DMR if needed
-            if dmr_key not in dmr_data_dict:
-                dmr_data_dict[dmr_key] = defaultdict(dict)
-            
-            # Store coverage info for each position in this DMR for this sample
-            for _, row in group.iterrows():
-                pos_key = (row['chr'], row['pos'])
-                dmr_data_dict[dmr_key][pos_key][sample] = row['coverage']
-                
-                # Store position info (only need to do this once)
-                if pos_key not in pos_info:
-                    pos_info[pos_key] = {
-                        'chr': row['chr'],
-                        'pos': row['pos'],
-                        'chr_dmr': row['chr_dmr'],
-                        'start_dmr': row['start_dmr'],
-                        'end_dmr': row['end_dmr']
-                    }
+    if merged_df.empty:
+        raise ValueError("No common positions found across all samples")
     
-    # Add position info to the dmr_data_dict
-    for dmr_key in dmr_data_dict:
-        for pos_key in dmr_data_dict[dmr_key]:
-            if pos_key in pos_info:
-                dmr_data_dict[dmr_key][pos_key]['info'] = pos_info[pos_key]
-    
-    return dmr_data_dict, common_dmrs, len(sample_dfs)
+    return merged_df
 
-def process_dmr_batch(dmr_batch, all_samples_count):
+def process_batch(batch_df, coverage_cols):
     """
-    Process a batch of DMRs to find the position with max coverage in each.
+    Process a batch of positions to find the maximum coverage position for each DMR.
     
     Args:
-        dmr_batch (list): List of (dmr_key, dmr_data) tuples
-        all_samples_count (int): Number of samples
+        batch_df (pd.DataFrame): Batch of positions with coverage information
+        coverage_cols (list): List of coverage column names
         
     Returns:
-        list: List of (dmr_key, position_info) tuples for successfully processed DMRs
+        pd.DataFrame: DataFrame with maximum coverage positions for each DMR
     """
-    results = []
+    # Calculate mean coverage across all samples for each position
+    batch_df['mean_coverage'] = batch_df[coverage_cols].mean(axis=1)
     
-    for dmr_key, dmr_data in dmr_batch:
-        # Filter positions that appear in all samples
-        complete_positions = {
-            pos_key: pos_data 
-            for pos_key, pos_data in dmr_data.items() 
-            if len(pos_data) - (1 if 'info' in pos_data else 0) == all_samples_count
-        }
-        
-        # If no positions in this DMR are covered in all samples, skip this DMR
-        if not complete_positions:
-            continue
-            
-        # Find the position with the highest mean coverage
-        max_mean_cov = 0
-        max_pos = None
-        
-        for pos_key, pos_data in complete_positions.items():
-            # Calculate mean coverage (excluding the 'info' key)
-            coverage_values = [cov for k, cov in pos_data.items() if k != 'info']
-            mean_cov = sum(coverage_values) / len(coverage_values)
-            
-            if mean_cov > max_mean_cov:
-                max_mean_cov = mean_cov
-                max_pos = pos_key
-                
-        # Store the max coverage position for this DMR
-        if max_pos and 'info' in complete_positions[max_pos]:
-            info = complete_positions[max_pos]['info']
-            position_info = {
-                'chr': info['chr'],
-                'pos': info['pos'],
-                'mean_coverage': max_mean_cov,
-                'chr_dmr': info['chr_dmr'],
-                'start_dmr': info['start_dmr'],
-                'end_dmr': info['end_dmr']
-            }
-            results.append((dmr_key, position_info))
+    # Group by DMR key and find the position with maximum mean coverage
+    max_pos_indices = batch_df.groupby('dmr_key')['mean_coverage'].idxmax()
     
-    return results
+    # Extract the rows with maximum coverage for each DMR
+    max_pos_df = batch_df.loc[max_pos_indices]
+    
+    # Select required columns for output
+    output_columns = ['chr', 'pos', 'mean_coverage', 'chr_dmr', 'start_dmr', 'end_dmr', 'dmr_key']
+    result_df = max_pos_df[output_columns]
+    
+    return result_df
 
-def find_max_coverage_positions_parallel_optimized(dmr_data_dict, common_dmrs, all_samples_count, num_processes):
+def find_max_coverage_positions(merged_df, num_processes):
     """
-    Find positions with maximum coverage in each DMR using optimized parallel processing.
+    Find positions with maximum coverage in each DMR in parallel.
     
     Args:
-        dmr_data_dict (dict): Preprocessed data organized by DMR
-        common_dmrs (set): Set of DMR keys common to all samples
-        all_samples_count (int): Total number of samples
+        merged_df (pd.DataFrame): Merged DataFrame with coverage information for all samples
         num_processes (int): Number of processes to use
         
     Returns:
         pd.DataFrame: DataFrame with maximum coverage positions
-        
-    Raises:
-        ValueError: If no maximum coverage positions found
     """
-    console.print(f"[bold blue]Processing DMRs in batches using {num_processes} processes...[/bold blue]")
+    console.print("[bold blue]Finding maximum coverage positions...[/bold blue]")
     
-    # Prepare data for batch processing
-    dmr_items = list(dmr_data_dict.items())
+    # Get coverage columns (those starting with 'coverage_')
+    coverage_cols = [col for col in merged_df.columns if col.startswith('coverage_')]
     
-    # Determine optimal batch size based on number of DMRs and processes
-    total_dmrs = len(dmr_items)
-    batch_size = max(1, min(100, total_dmrs // (num_processes * 4)))
+    # Get unique DMR keys
+    dmr_keys = merged_df['dmr_key'].unique()
+    console.print(f"[bold green]Processing {len(dmr_keys)} unique DMRs[/bold green]")
     
-    # Create batches of DMRs
-    batches = [dmr_items[i:i+batch_size] for i in range(0, total_dmrs, batch_size)]
+    # Process in batches
+    batch_size = max(1, len(dmr_keys) // (num_processes * 4))
+    dmr_batches = [dmr_keys[i:i+batch_size] for i in range(0, len(dmr_keys), batch_size)]
     
-    console.print(f"[bold green]Processing {total_dmrs} DMRs in {len(batches)} batches (batch size: {batch_size})[/bold green]")
+    console.print(f"[bold green]Processing in {len(dmr_batches)} batches (batch size: {batch_size})[/bold green]")
     
-    # Create a partial function with fixed parameters
-    process_func = partial(process_dmr_batch, all_samples_count=all_samples_count)
+    # Create a function to process one batch of DMRs
+    def process_dmr_batch(dmr_batch):
+        # Filter DataFrame for the batch of DMRs
+        batch_df = merged_df[merged_df['dmr_key'].isin(dmr_batch)]
+        return process_batch(batch_df, coverage_cols)
     
     # Use multiprocessing to process DMR batches in parallel
     with mp.Pool(processes=num_processes) as pool:
         batch_results = list(tqdm(
-            pool.imap(process_func, batches),
-            total=len(batches),
+            pool.imap(process_dmr_batch, dmr_batches),
+            total=len(dmr_batches),
             desc="Processing DMR batches",
             unit="batch"
         ))
     
-    # Flatten results and convert to dictionary
-    dmr_results = list(itertools.chain.from_iterable(batch_results))
+    # Combine results
+    result_df = pd.concat(batch_results, ignore_index=True)
     
-    if not dmr_results:
-        raise ValueError("No maximum coverage positions found that are covered in all samples")
+    if result_df.empty:
+        raise ValueError("No maximum coverage positions found")
     
-    # Convert to dictionary and then to DataFrame
-    dmr_max_positions = {dmr_key: pos_info for dmr_key, pos_info in dmr_results}
-    result_df = pd.DataFrame(list(dmr_max_positions.values()))
-    
-    # Sort by chromosome and start position of DMR
+    # Sort by DMR coordinates
     result_df = result_df.sort_values(['chr_dmr', 'start_dmr']).reset_index(drop=True)
     
     # Add DMR index
     result_df['dmr_index'] = range(1, len(result_df) + 1)
     
-    # Reorder columns
+    # Reorder and select final columns
     result_df = result_df[['chr', 'pos', 'mean_coverage', 'dmr_index', 'chr_dmr', 'start_dmr', 'end_dmr']]
     
     return result_df
@@ -338,19 +274,18 @@ def main(input, output, ncpus, verbose):
         # Read all input CSV files in parallel
         sample_dfs = read_coverage_files_parallel(input_files, ncpus)
         
-        # Preprocess data for efficient DMR processing
-        dmr_data_dict, common_dmrs, all_samples_count = preprocess_data_for_dmr_processing(sample_dfs)
+        # Merge all DataFrames
+        merged_df = merge_sample_dataframes(sample_dfs)
+        
+        # Count unique DMRs
+        dmr_count = merged_df['dmr_key'].nunique()
+        console.print(f"[bold green]Found {dmr_count} common DMRs across all samples[/bold green]")
         
         # We can release the original dataframes to save memory
         del sample_dfs
         
-        # Find maximum coverage positions in parallel with optimized approach
-        max_cov_df = find_max_coverage_positions_parallel_optimized(
-            dmr_data_dict,
-            common_dmrs,
-            all_samples_count,
-            ncpus
-        )
+        # Find maximum coverage positions in parallel
+        max_cov_df = find_max_coverage_positions(merged_df, ncpus)
         
         # Create output directory if it doesn't exist
         output_dir = os.path.dirname(output)

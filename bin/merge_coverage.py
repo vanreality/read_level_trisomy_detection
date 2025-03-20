@@ -159,6 +159,22 @@ def process_batch(batch_df, coverage_cols):
     
     return result_df
 
+def process_dmr_batch(dmr_batch, merged_df, coverage_cols):
+    """
+    Process a batch of DMRs to find maximum coverage positions.
+    
+    Args:
+        dmr_batch (list): List of DMR keys to process
+        merged_df (pd.DataFrame): Merged DataFrame with all sample data
+        coverage_cols (list): List of coverage column names
+        
+    Returns:
+        pd.DataFrame: DataFrame with maximum coverage positions for the batch of DMRs
+    """
+    # Filter DataFrame for the batch of DMRs
+    batch_df = merged_df[merged_df['dmr_key'].isin(dmr_batch)]
+    return process_batch(batch_df, coverage_cols)
+
 def find_max_coverage_positions(merged_df, num_processes):
     """
     Find positions with maximum coverage in each DMR in parallel.
@@ -185,16 +201,13 @@ def find_max_coverage_positions(merged_df, num_processes):
     
     console.print(f"[bold green]Processing in {len(dmr_batches)} batches (batch size: {batch_size})[/bold green]")
     
-    # Create a function to process one batch of DMRs
-    def process_dmr_batch(dmr_batch):
-        # Filter DataFrame for the batch of DMRs
-        batch_df = merged_df[merged_df['dmr_key'].isin(dmr_batch)]
-        return process_batch(batch_df, coverage_cols)
+    # Create a partial function with the needed arguments
+    process_func = partial(process_dmr_batch, merged_df=merged_df, coverage_cols=coverage_cols)
     
     # Use multiprocessing to process DMR batches in parallel
     with mp.Pool(processes=num_processes) as pool:
         batch_results = list(tqdm(
-            pool.imap(process_dmr_batch, dmr_batches),
+            pool.imap(process_func, dmr_batches),
             total=len(dmr_batches),
             desc="Processing DMR batches",
             unit="batch"

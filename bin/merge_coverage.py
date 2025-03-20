@@ -144,6 +144,9 @@ def process_batch(batch_df, coverage_cols):
     Returns:
         pd.DataFrame: DataFrame with maximum coverage positions for each DMR
     """
+    # Make a copy to avoid SettingWithCopyWarning
+    batch_df = batch_df.copy()
+    
     # Calculate mean coverage across all samples for each position
     batch_df['mean_coverage'] = batch_df[coverage_cols].mean(axis=1)
     

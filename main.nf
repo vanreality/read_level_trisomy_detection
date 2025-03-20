@@ -49,6 +49,7 @@ workflow  {
         // Use the provided max coverage file
         Channel.fromPath(params.max_coverage_file)
             .map { file -> file }
+            .broadcast()
             .set { ch_max_coverage_file }
     } else {
         // 2. Calculate max coverage positions of each sample

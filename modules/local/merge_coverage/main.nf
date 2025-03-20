@@ -14,6 +14,7 @@ process MERGE_COVERAGE {
     """
     python3 ${script} \\
         ${coverage_files_args} \\
+        --ncpus ${task.cpus} \\
         ${args}
     """
 }

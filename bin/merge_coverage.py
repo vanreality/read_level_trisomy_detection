@@ -13,46 +13,78 @@ from rich.panel import Panel
 from rich import print as rprint
 import time
 import glob
+import multiprocessing as mp
+from functools import partial
 
 # Initialize console for rich output
 console = Console()
 
-def read_coverage_files(input_files):
+def read_single_file(file_path):
     """
-    Read and combine multiple coverage CSV files.
+    Read a single coverage CSV file.
+    
+    Args:
+        file_path (str): Path to the coverage CSV file
+        
+    Returns:
+        tuple: (sample_name, DataFrame) or (None, None) if error occurred
+        
+    Raises:
+        ValueError: If required columns are missing
+    """
+    try:
+        # Get sample name from file name
+        sample_name = Path(file_path).stem
+        
+        # Read CSV file
+        df = pd.read_csv(file_path)
+        
+        # Validate required columns
+        required_columns = ['chr', 'pos', 'coverage', 'chr_dmr', 'start_dmr', 'end_dmr']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            raise ValueError(f"File {file_path} is missing required columns: {', '.join(missing_columns)}")
+        
+        # Add DMR key column
+        df['dmr_key'] = df.apply(create_dmr_key, axis=1)
+        
+        return (sample_name, df)
+        
+    except Exception as e:
+        console.print(f"[bold red]Error reading file {file_path}:[/bold red] {str(e)}", style="red")
+        return (None, None)
+
+def read_coverage_files_parallel(input_files, num_processes):
+    """
+    Read multiple coverage CSV files in parallel.
     
     Args:
         input_files (list): List of input CSV file paths
+        num_processes (int): Number of processes to use
         
     Returns:
         dict: Dictionary mapping sample names to DataFrames
         
     Raises:
-        ValueError: If required columns are missing in any file
+        ValueError: If no valid files were read
     """
-    sample_dfs = {}
+    console.print(f"[bold blue]Reading {len(input_files)} files using {num_processes} processes...[/bold blue]")
     
-    for file_path in tqdm(input_files, desc="Reading input files"):
-        try:
-            # Get sample name from file name
-            sample_name = Path(file_path).stem
-            
-            # Read CSV file
-            df = pd.read_csv(file_path)
-            
-            # Validate required columns
-            required_columns = ['chr', 'pos', 'coverage', 'chr_dmr', 'start_dmr', 'end_dmr']
-            missing_columns = [col for col in required_columns if col not in df.columns]
-            
-            if missing_columns:
-                raise ValueError(f"File {file_path} is missing required columns: {', '.join(missing_columns)}")
-            
-            # Store DataFrame
-            sample_dfs[sample_name] = df
-            
-        except Exception as e:
-            console.print(f"[bold red]Error reading file {file_path}:[/bold red] {str(e)}", style="red")
-            raise
+    # Use multiprocessing to read files in parallel
+    with mp.Pool(processes=num_processes) as pool:
+        results = list(tqdm(
+            pool.imap(read_single_file, input_files),
+            total=len(input_files),
+            desc="Reading input files",
+            unit="file"
+        ))
+    
+    # Filter out None results and create dictionary
+    sample_dfs = {name: df for name, df in results if name is not None}
+    
+    if not sample_dfs:
+        raise ValueError("No valid files were read successfully")
     
     return sample_dfs
 
@@ -68,12 +100,84 @@ def create_dmr_key(row):
     """
     return f"{row['chr_dmr']}:{row['start_dmr']}-{row['end_dmr']}"
 
-def find_max_coverage_positions(sample_dfs):
+def process_single_dmr(dmr_data):
     """
-    Find positions with maximum coverage in each DMR across all samples.
+    Process a single DMR to find the position with max coverage.
+    
+    Args:
+        dmr_data (tuple): (dmr_key, sample_dfs, all_samples_count)
+        
+    Returns:
+        tuple: (dmr_key, position_info) or None if no suitable position found
+    """
+    dmr_key, sample_dfs, all_samples_count = dmr_data
+    
+    # Dictionary to store position info and coverage for each sample
+    pos_coverage = defaultdict(list)
+    pos_info = {}
+    
+    # Find all positions in this DMR for each sample
+    for sample, df in sample_dfs.items():
+        dmr_df = df[df['dmr_key'] == dmr_key]
+        
+        # If DMR has no positions in this sample, skip to next DMR
+        if dmr_df.empty:
+            continue
+            
+        # For each position in this DMR, record its coverage
+        for _, row in dmr_df.iterrows():
+            pos_key = (row['chr'], row['pos'])
+            pos_coverage[pos_key].append(row['coverage'])
+            
+            # Store position info (only need to do this once)
+            if pos_key not in pos_info:
+                pos_info[pos_key] = {
+                    'chr': row['chr'],
+                    'pos': row['pos'],
+                    'chr_dmr': row['chr_dmr'],
+                    'start_dmr': row['start_dmr'],
+                    'end_dmr': row['end_dmr']
+                }
+    
+    # Filter positions that appear in all samples
+    complete_positions = {pos: covs for pos, covs in pos_coverage.items() if len(covs) == all_samples_count}
+    
+    # If no positions in this DMR are covered in all samples, skip this DMR
+    if not complete_positions:
+        return None
+        
+    # Find the position with the highest mean coverage
+    max_mean_cov = 0
+    max_pos = None
+    
+    for pos, covs in complete_positions.items():
+        mean_cov = sum(covs) / len(covs)
+        if mean_cov > max_mean_cov:
+            max_mean_cov = mean_cov
+            max_pos = pos
+    
+    # Return the max coverage position for this DMR
+    if max_pos:
+        info = pos_info[max_pos]
+        position_info = {
+            'chr': info['chr'],
+            'pos': info['pos'],
+            'mean_coverage': max_mean_cov,
+            'chr_dmr': info['chr_dmr'],
+            'start_dmr': info['start_dmr'],
+            'end_dmr': info['end_dmr']
+        }
+        return (dmr_key, position_info)
+    
+    return None
+
+def find_max_coverage_positions_parallel(sample_dfs, num_processes):
+    """
+    Find positions with maximum coverage in each DMR across all samples using parallel processing.
     
     Args:
         sample_dfs (dict): Dictionary mapping sample names to DataFrames
+        num_processes (int): Number of processes to use
         
     Returns:
         pd.DataFrame: DataFrame with maximum coverage positions
@@ -83,15 +187,8 @@ def find_max_coverage_positions(sample_dfs):
     """
     console.print("[bold blue]Finding maximum coverage positions...[/bold blue]")
     
-    # Step 1: Create a set of all DMRs in each sample
-    sample_dmrs = {}
-    for sample, df in sample_dfs.items():
-        # Add DMR key column
-        df['dmr_key'] = df.apply(create_dmr_key, axis=1)
-        # Store unique DMRs for this sample
-        sample_dmrs[sample] = set(df['dmr_key'].unique())
-    
-    # Step 2: Find DMRs present in all samples
+    # Step 1: Find DMRs present in all samples
+    sample_dmrs = {sample: set(df['dmr_key'].unique()) for sample, df in sample_dfs.items()}
     common_dmrs = set.intersection(*sample_dmrs.values()) if sample_dmrs else set()
     
     if not common_dmrs:
@@ -99,71 +196,31 @@ def find_max_coverage_positions(sample_dfs):
     
     console.print(f"[bold green]Found {len(common_dmrs)} common DMRs across all samples[/bold green]")
     
-    # Step 3: For each common DMR, find the position with max coverage in each sample
-    dmr_max_positions = {}
+    # Step 2: Process each DMR in parallel
+    all_samples_count = len(sample_dfs)
     
-    for dmr_key in tqdm(common_dmrs, desc="Processing DMRs"):
-        # Dictionary to store position info and coverage for each sample
-        pos_coverage = defaultdict(list)
-        pos_info = {}
-        
-        # Find all positions in this DMR for each sample
-        for sample, df in sample_dfs.items():
-            dmr_df = df[df['dmr_key'] == dmr_key]
-            
-            # If DMR has no positions in this sample, skip to next DMR
-            if dmr_df.empty:
-                continue
-                
-            # For each position in this DMR, record its coverage
-            for _, row in dmr_df.iterrows():
-                pos_key = (row['chr'], row['pos'])
-                pos_coverage[pos_key].append(row['coverage'])
-                
-                # Store position info (only need to do this once)
-                if pos_key not in pos_info:
-                    pos_info[pos_key] = {
-                        'chr': row['chr'],
-                        'pos': row['pos'],
-                        'chr_dmr': row['chr_dmr'],
-                        'start_dmr': row['start_dmr'],
-                        'end_dmr': row['end_dmr']
-                    }
-        
-        # Filter positions that appear in all samples
-        all_samples_count = len(sample_dfs)
-        complete_positions = {pos: covs for pos, covs in pos_coverage.items() if len(covs) == all_samples_count}
-        
-        # If no positions in this DMR are covered in all samples, skip this DMR
-        if not complete_positions:
-            continue
-            
-        # Find the position with the highest mean coverage
-        max_mean_cov = 0
-        max_pos = None
-        
-        for pos, covs in complete_positions.items():
-            mean_cov = sum(covs) / len(covs)
-            if mean_cov > max_mean_cov:
-                max_mean_cov = mean_cov
-                max_pos = pos
-        
-        # Store the max coverage position for this DMR
-        if max_pos:
-            info = pos_info[max_pos]
-            dmr_max_positions[dmr_key] = {
-                'chr': info['chr'],
-                'pos': info['pos'],
-                'mean_coverage': max_mean_cov,
-                'chr_dmr': info['chr_dmr'],
-                'start_dmr': info['start_dmr'],
-                'end_dmr': info['end_dmr']
-            }
+    # Prepare data for parallel processing
+    dmr_data_list = [(dmr_key, sample_dfs, all_samples_count) for dmr_key in common_dmrs]
     
-    # Convert to DataFrame and sort by DMR coordinates
-    if not dmr_max_positions:
+    console.print(f"[bold blue]Processing DMRs using {num_processes} processes...[/bold blue]")
+    
+    # Use multiprocessing to process DMRs in parallel
+    with mp.Pool(processes=num_processes) as pool:
+        results = list(tqdm(
+            pool.imap(process_single_dmr, dmr_data_list),
+            total=len(dmr_data_list),
+            desc="Processing DMRs",
+            unit="DMR"
+        ))
+    
+    # Filter out None results
+    dmr_results = [result for result in results if result is not None]
+    
+    if not dmr_results:
         raise ValueError("No maximum coverage positions found that are covered in all samples")
     
+    # Convert to dictionary and then to DataFrame
+    dmr_max_positions = {dmr_key: pos_info for dmr_key, pos_info in dmr_results}
     result_df = pd.DataFrame(list(dmr_max_positions.values()))
     
     # Sort by chromosome and start position of DMR
@@ -180,8 +237,9 @@ def find_max_coverage_positions(sample_dfs):
 @click.command()
 @click.option('--input', required=True, multiple=True, help='Path(s) to input coverage CSV file(s). Can use wildcards with quotes.')
 @click.option('--output', default='max_cov_pos.csv', help='Path to output CSV file (default: max_cov_pos.csv)')
+@click.option('--ncpus', type=int, default=None, help='Number of processes to use (default: number of CPU cores)')
 @click.option('--verbose', is_flag=True, help='Print verbose output')
-def main(input, output, verbose):
+def main(input, output, ncpus, verbose):
     """
     Find maximum coverage positions for each DMR across multiple samples.
     
@@ -194,6 +252,13 @@ def main(input, output, verbose):
     start_time = time.time()
     
     try:
+        # Set number of processes
+        if ncpus is None:
+            ncpus = mp.cpu_count()
+        
+        # Limit ncpus to available cores
+        ncpus = min(ncpus, mp.cpu_count())
+        
         # Expand wildcards if any and handle space-separated filenames
         input_files = []
         for pattern in input:
@@ -217,16 +282,17 @@ def main(input, output, verbose):
         
         console.print(Panel.fit(
             f"[bold green]Processing [/bold green]{len(input_files)}[bold green] coverage files[/bold green]\n"
+            f"[bold green]Using [/bold green]{ncpus}[bold green] CPU cores[/bold green]\n"
             f"[bold green]Output will be saved to:[/bold green] {output}",
             title="Maximum Coverage Position Analysis", 
             border_style="blue"
         ))
         
-        # Read all input CSV files
-        sample_dfs = read_coverage_files(input_files)
+        # Read all input CSV files in parallel
+        sample_dfs = read_coverage_files_parallel(input_files, ncpus)
         
-        # Find maximum coverage positions
-        max_cov_df = find_max_coverage_positions(sample_dfs)
+        # Find maximum coverage positions in parallel
+        max_cov_df = find_max_coverage_positions_parallel(sample_dfs, ncpus)
         
         # Create output directory if it doesn't exist
         output_dir = os.path.dirname(output)

@@ -12,7 +12,7 @@ process EXTRACT_READ_FROM_PARQUET {
     
     script:
     def args = task.ext.args ?: ''
-    def prefix = meta.id
+    def prefix = "${meta.id}_${meta.label}"
     """
     python3 ${script} \\
         --input ${parquet_file} \\

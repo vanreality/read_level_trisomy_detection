@@ -46,11 +46,12 @@ workflow  {
     
     // Determine if we should use provided max_coverage_file or generate one
     if (params.max_coverage_file) {
-        // Use the provided max coverage file
-        Channel.fromPath(params.max_coverage_file)
-            .map { file -> file }
-            .broadcast()
-            .set { ch_max_coverage_file }
+        // Use the provided max coverage file as a value channel
+        def maxCovFile = file(params.max_coverage_file)
+        if (!maxCovFile.exists()) {
+            error "Max coverage file not found: ${params.max_coverage_file}"
+        }
+        ch_max_coverage_file = Channel.value(maxCovFile)
     } else {
         // 2. Calculate max coverage positions of each sample
         CALCULATE_COVERAGE(

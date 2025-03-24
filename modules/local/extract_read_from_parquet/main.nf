@@ -8,7 +8,7 @@ process EXTRACT_READ_FROM_PARQUET {
     path(script)
     
     output:
-    tuple val(meta), path("*.fa"), emit: fa
+    tuple val(meta), path("*.tsv"), emit: tsv
     
     script:
     def args = task.ext.args ?: ''

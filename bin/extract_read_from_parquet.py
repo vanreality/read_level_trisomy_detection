@@ -162,7 +162,7 @@ def read_and_prefilter_parquet(parquet_file, max_coverage_df, chunk_size=1000000
     
     return dmr_reads_dict
 
-def calculate_methylation_stats(filtered_methylation_df, read_start=None, read_end=None):
+def calculate_methylation_stats(filtered_methylation_df, read_start=None, read_end=None, read_seq=None):
     """
     Calculate methylation statistics for CpG sites within a DMR, masking sites outside the read region.
     
@@ -170,44 +170,76 @@ def calculate_methylation_stats(filtered_methylation_df, read_start=None, read_e
         filtered_methylation_df (pd.DataFrame): Pre-filtered methylation data for a DMR
         read_start (int, optional): Start position of the read. If provided, CpG sites before this position are masked
         read_end (int, optional): End position of the read. If provided, CpG sites after this position are masked
+        read_seq (str, optional): Read sequence. If provided, creates read-level methylation vectors
         
     Returns:
-        tuple: (raw_methylation_list, prob_weighted_methylation_list, cpg_positions)
+        tuple: (
+            raw_dmr_level_methylation_list, 
+            prob_weighted_dmr_level_methylation_list, 
+            cpg_positions,
+            raw_read_level_methylation_list,
+            prob_weighted_read_level_methylation_list
+        )
     """
     if filtered_methylation_df.empty:
-        return [], [], []
+        # Return empty lists for all outputs
+        return [], [], [], [], []
     
     # Group by CpG site coordinates
     grouped = filtered_methylation_df.groupby(['chr', 'start', 'end'])
     
-    raw_methylation_list = []
-    prob_weighted_methylation_list = []
+    # DMR-level methylation lists - one value per CpG site in the DMR
+    raw_dmr_level_methylation_list = []
+    prob_weighted_dmr_level_methylation_list = []
     cpg_positions = []
+    
+    # Read-level methylation lists - one value per base in the read sequence
+    # Initialize with zeros for all positions
+    read_length = len(read_seq) if read_seq is not None else 0
+    raw_read_level_methylation_list = [0.0] * read_length
+    prob_weighted_read_level_methylation_list = [0.0] * read_length
     
     for (chr_val, start, end), group in grouped:
         # Record the CpG position
         cpg_positions.append((chr_val, start, end))
         
+        # Calculate raw and probability-weighted methylation rates
+        raw_rate = group['status'].sum() / len(group)
+        
+        prob_sum = group['prob_class_1'].sum()
+        if prob_sum > 0:  # Avoid division by zero
+            weighted_rate = (group['status'] * group['prob_class_1']).sum() / prob_sum
+        else:
+            weighted_rate = 0.0
+        
         # Check if this CpG site is within the read region
         if (read_start is not None and read_end is not None and 
             (start < read_start or end > read_end)):
-            # CpG site is outside the read region, mask with 0
-            raw_methylation_list.append(0.0)
-            prob_weighted_methylation_list.append(0.0)
+            # CpG site is outside the read region, mask with 0 at DMR level
+            raw_dmr_level_methylation_list.append(0.0)
+            prob_weighted_dmr_level_methylation_list.append(0.0)
         else:
-            # Calculate raw methylation rate
-            raw_rate = group['status'].sum() / len(group)
-            raw_methylation_list.append(raw_rate)
+            # CpG site is within the read region
+            raw_dmr_level_methylation_list.append(raw_rate)
+            prob_weighted_dmr_level_methylation_list.append(weighted_rate)
             
-            # Calculate probability-weighted methylation rate
-            prob_sum = group['prob_class_1'].sum()
-            if prob_sum > 0:  # Avoid division by zero
-                weighted_rate = (group['status'] * group['prob_class_1']).sum() / prob_sum
-                prob_weighted_methylation_list.append(weighted_rate)
-            else:
-                prob_weighted_methylation_list.append(0.0)
+            # If we have a read sequence, map this CpG to the read position
+            if read_seq is not None and read_start is not None:
+                # Calculate the relative position of this CpG site in the read
+                # For simplicity, use the middle position of the CpG site
+                cpg_middle_pos = (start + end) // 2
+                relative_pos = cpg_middle_pos - read_start
+                
+                # Ensure the position is within bounds of the read sequence
+                if 0 <= relative_pos < read_length:
+                    raw_read_level_methylation_list[relative_pos] = raw_rate
+                    prob_weighted_read_level_methylation_list[relative_pos] = weighted_rate
     
-    return raw_methylation_list, prob_weighted_methylation_list, cpg_positions
+    return (raw_dmr_level_methylation_list, 
+            prob_weighted_dmr_level_methylation_list, 
+            cpg_positions,
+            raw_read_level_methylation_list,
+            prob_weighted_read_level_methylation_list)
 
 def process_dmr(dmr_data, mode):
     """
@@ -253,10 +285,12 @@ def process_dmr(dmr_data, mode):
             best_read = filtered_reads_df.iloc[0]
             
             # Calculate methylation statistics for this DMR, masking sites outside the read region
-            raw_meth, prob_meth, cpg_positions = calculate_methylation_stats(
+            # Also include the read sequence for read-level methylation mapping
+            raw_dmr_level, prob_weighted_dmr_level, cpg_positions, raw_read_level, prob_weighted_read_level = calculate_methylation_stats(
                 filtered_methylation_df, 
                 read_start=best_read['start'],
-                read_end=best_read['end']
+                read_end=best_read['end'],
+                read_seq=best_read['seq']
             )
             
             return {
@@ -273,8 +307,10 @@ def process_dmr(dmr_data, mode):
                     'chr': best_read['chr']
                 },
                 'methylation': {
-                    'raw': raw_meth,
-                    'prob_weighted': prob_meth,
+                    'raw_dmr_level': raw_dmr_level,
+                    'prob_weighted_dmr_level': prob_weighted_dmr_level,
+                    'raw_read_level': raw_read_level,
+                    'prob_weighted_read_level': prob_weighted_read_level,
                     'cpg_positions': cpg_positions
                 }
             }
@@ -348,10 +384,11 @@ def write_tsv(selected_reads, output_file):
             read = read_data['read']
             methylation = read_data['methylation']
             
-            # Format raw and weighted methylation lists with commas
-            # TSV format uses tabs as separators so commas within fields won't cause parsing issues
-            raw_meth_str = ','.join([f"{x:.3f}" for x in methylation['raw']])
-            prob_meth_str = ','.join([f"{x:.3f}" for x in methylation['prob_weighted']])
+            # Format methylation vectors 
+            raw_dmr_level_str = ','.join([f"{x:.3f}" for x in methylation['raw_dmr_level']])
+            prob_weighted_dmr_level_str = ','.join([f"{x:.3f}" for x in methylation['prob_weighted_dmr_level']])
+            raw_read_level_str = ','.join([f"{x:.3f}" for x in methylation['raw_read_level']])
+            prob_weighted_read_level_str = ','.join([f"{x:.3f}" for x in methylation['prob_weighted_read_level']])
             
             # Create a row for the DataFrame
             row = {
@@ -363,8 +400,10 @@ def write_tsv(selected_reads, output_file):
                 'read_start': read['start'],
                 'read_end': read['end'],
                 'prob_class_1': read['prob_class_1'],
-                'raw_methylation_vector': raw_meth_str,
-                'prob_weighted_methylation_vector': prob_meth_str,
+                'raw_dmr_level_methylation_vector': raw_dmr_level_str,
+                'prob_weighted_dmr_level_methylation_vector': prob_weighted_dmr_level_str,
+                'raw_read_level_methylation_vector': raw_read_level_str,
+                'prob_weighted_read_level_methylation_vector': prob_weighted_read_level_str,
                 'sequence': read['seq']
             }
             

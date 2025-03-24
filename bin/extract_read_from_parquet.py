@@ -162,39 +162,52 @@ def read_and_prefilter_parquet(parquet_file, max_coverage_df, chunk_size=1000000
     
     return dmr_reads_dict
 
-def calculate_methylation_stats(filtered_methylation_df):
+def calculate_methylation_stats(filtered_methylation_df, read_start=None, read_end=None):
     """
-    Calculate methylation statistics for CpG sites within a DMR.
+    Calculate methylation statistics for CpG sites within a DMR, masking sites outside the read region.
     
     Args:
         filtered_methylation_df (pd.DataFrame): Pre-filtered methylation data for a DMR
+        read_start (int, optional): Start position of the read. If provided, CpG sites before this position are masked
+        read_end (int, optional): End position of the read. If provided, CpG sites after this position are masked
         
     Returns:
-        tuple: (raw_methylation_list, prob_weighted_methylation_list)
+        tuple: (raw_methylation_list, prob_weighted_methylation_list, cpg_positions)
     """
     if filtered_methylation_df.empty:
-        return [], []
+        return [], [], []
     
     # Group by CpG site coordinates
     grouped = filtered_methylation_df.groupby(['chr', 'start', 'end'])
     
     raw_methylation_list = []
     prob_weighted_methylation_list = []
+    cpg_positions = []
     
-    for _, group in grouped:
-        # Calculate raw methylation rate
-        raw_rate = group['status'].sum() / len(group)
-        raw_methylation_list.append(raw_rate)
+    for (chr_val, start, end), group in grouped:
+        # Record the CpG position
+        cpg_positions.append((chr_val, start, end))
         
-        # Calculate probability-weighted methylation rate
-        prob_sum = group['prob_class_1'].sum()
-        if prob_sum > 0:  # Avoid division by zero
-            weighted_rate = (group['status'] * group['prob_class_1']).sum() / prob_sum
-            prob_weighted_methylation_list.append(weighted_rate)
-        else:
+        # Check if this CpG site is within the read region
+        if (read_start is not None and read_end is not None and 
+            (start < read_start or end > read_end)):
+            # CpG site is outside the read region, mask with 0
+            raw_methylation_list.append(0.0)
             prob_weighted_methylation_list.append(0.0)
+        else:
+            # Calculate raw methylation rate
+            raw_rate = group['status'].sum() / len(group)
+            raw_methylation_list.append(raw_rate)
+            
+            # Calculate probability-weighted methylation rate
+            prob_sum = group['prob_class_1'].sum()
+            if prob_sum > 0:  # Avoid division by zero
+                weighted_rate = (group['status'] * group['prob_class_1']).sum() / prob_sum
+                prob_weighted_methylation_list.append(weighted_rate)
+            else:
+                prob_weighted_methylation_list.append(0.0)
     
-    return raw_methylation_list, prob_weighted_methylation_list
+    return raw_methylation_list, prob_weighted_methylation_list, cpg_positions
 
 def process_dmr(dmr_data, mode):
     """
@@ -239,8 +252,12 @@ def process_dmr(dmr_data, mode):
         if not filtered_reads_df.empty:
             best_read = filtered_reads_df.iloc[0]
             
-            # Calculate methylation statistics for this DMR
-            raw_meth, prob_meth = calculate_methylation_stats(filtered_methylation_df)
+            # Calculate methylation statistics for this DMR, masking sites outside the read region
+            raw_meth, prob_meth, cpg_positions = calculate_methylation_stats(
+                filtered_methylation_df, 
+                read_start=best_read['start'],
+                read_end=best_read['end']
+            )
             
             return {
                 'dmr_index': dmr['dmr_index'],
@@ -250,11 +267,15 @@ def process_dmr(dmr_data, mode):
                     'prob_class_1': best_read['prob_class_1'],
                     'chr_dmr': dmr['chr_dmr'],
                     'start_dmr': dmr['start_dmr'],
-                    'end_dmr': dmr['end_dmr']
+                    'end_dmr': dmr['end_dmr'],
+                    'start': best_read['start'],
+                    'end': best_read['end'],
+                    'chr': best_read['chr']
                 },
                 'methylation': {
                     'raw': raw_meth,
-                    'prob_weighted': prob_meth
+                    'prob_weighted': prob_meth,
+                    'cpg_positions': cpg_positions
                 }
             }
         
@@ -307,46 +328,56 @@ def extract_reads_parallel(max_coverage_df, dmr_reads_dict, dmr_methylation_dict
     
     return selected_reads
 
-def write_fasta(selected_reads, output_file):
+def write_tsv(selected_reads, output_file):
     """
-    Write selected reads to a FASTA file.
+    Write selected reads to a TSV file.
     
     Args:
         selected_reads (list): List of selected read data
-        output_file (str): Path to the output FASTA file
+        output_file (str): Path to the output TSV file
         
     Returns:
         int: Number of reads written
     """
     try:
-        with open(output_file, 'w') as f:
-            for read_data in selected_reads:
-                dmr_index = read_data['dmr_index']
-                read = read_data['read']
-                methylation = read_data['methylation']
-                
-                # Format raw and weighted methylation lists
-                raw_meth_str = ','.join([f"{x:.3f}" for x in methylation['raw']])
-                prob_meth_str = ','.join([f"{x:.3f}" for x in methylation['prob_weighted']])
-                
-                # Create header
-                header = (
-                    f"read_name:{read['name']},"
-                    f"dmr_index:{dmr_index},"
-                    f"dmr_coordinate:{read['chr_dmr']}-{read['start_dmr']}-{read['end_dmr']},"
-                    f"prob_class_1:{read['prob_class_1']:.3f},"
-                    f"raw_methylation_vector:[{raw_meth_str}],"
-                    f"prob_weighted_methylation_vector:[{prob_meth_str}]"
-                )
-                
-                # Write header and sequence
-                f.write(f">{header}\n")
-                f.write(f"{read['seq']}\n")
+        # Create a list to store all rows
+        rows = []
         
-        return len(selected_reads)
+        for read_data in selected_reads:
+            dmr_index = read_data['dmr_index']
+            read = read_data['read']
+            methylation = read_data['methylation']
+            
+            # Format raw and weighted methylation lists with commas
+            # TSV format uses tabs as separators so commas within fields won't cause parsing issues
+            raw_meth_str = ','.join([f"{x:.3f}" for x in methylation['raw']])
+            prob_meth_str = ','.join([f"{x:.3f}" for x in methylation['prob_weighted']])
+            
+            # Create a row for the DataFrame
+            row = {
+                'read_name': read['name'],
+                'dmr_index': dmr_index,
+                'chr': read['chr_dmr'],
+                'dmr_start': read['start_dmr'],
+                'dmr_end': read['end_dmr'],
+                'read_start': read['start'],
+                'read_end': read['end'],
+                'prob_class_1': read['prob_class_1'],
+                'raw_methylation_vector': raw_meth_str,
+                'prob_weighted_methylation_vector': prob_meth_str,
+                'sequence': read['seq']
+            }
+            
+            rows.append(row)
+        
+        # Create and write DataFrame to TSV (tab-separated values)
+        df = pd.DataFrame(rows)
+        df.to_csv(output_file, index=False, sep='\t')
+        
+        return len(rows)
     
     except Exception as e:
-        console.print(f"[bold red]Error writing FASTA file:[/bold red] {str(e)}", style="red")
+        console.print(f"[bold red]Error writing TSV file:[/bold red] {str(e)}", style="red")
         raise
 
 @click.command()
@@ -366,7 +397,7 @@ def main(input, max_coverage, methylation, mode, prefix, ncpus, chunk_size, verb
     This script processes a parquet file containing read data, a max coverage
     file containing the positions with maximum coverage for each DMR, and a
     methylation file with CpG methylation data. For each DMR, it selects one
-    read based on the specified selection mode and generates a FASTA file with
+    read based on the specified selection mode and generates a TSV file with
     the selected reads and their methylation information.
     
     The selection mode can be either 'longest' (select the longest read) or
@@ -389,8 +420,8 @@ def main(input, max_coverage, methylation, mode, prefix, ncpus, chunk_size, verb
         if ncpus is None:
             ncpus = mp.cpu_count()
         
-        # Define output file path
-        output_file = f"{prefix}.fa"
+        # Define output file path with .tsv extension
+        output_file = f"{prefix}.tsv"
         
         # Create output directory if it doesn't exist
         output_dir = os.path.dirname(output_file)
@@ -440,9 +471,9 @@ def main(input, max_coverage, methylation, mode, prefix, ncpus, chunk_size, verb
         del dmr_reads_dict
         del dmr_methylation_dict
         
-        # Write selected reads to FASTA file
+        # Write selected reads to TSV file
         console.print(f"[bold blue]Writing {len(selected_reads)} selected reads to[/bold blue] {output_file}")
-        num_written = write_fasta(selected_reads, output_file)
+        num_written = write_tsv(selected_reads, output_file)
         
         # Print statistics
         elapsed_time = time.time() - start_time

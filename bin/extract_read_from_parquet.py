@@ -243,11 +243,11 @@ def calculate_methylation_stats(filtered_methylation_df, read_start=None, read_e
 
 def process_dmr(dmr_data, mode):
     """
-    Process a single DMR to select and extract a read.
+    Process a single DMR to select and extract the top 10 reads.
     
     Args:
         dmr_data (tuple): (dmr_row, filtered_reads_df, filtered_methylation_df)
-        mode (str): Selection mode ('longest' or 'prob_largest')
+        mode (str): Selection mode ('length' or 'prob')
         
     Returns:
         tuple: (dmr_index, read_data, methylation_stats) or None if no suitable read found
@@ -268,52 +268,55 @@ def process_dmr(dmr_data, mode):
         if filtered_reads_df.empty:
             return None
         
-        # Select the best read based on the specified mode
-        if mode == 'longest':
+        # Select the top 10 reads based on the specified mode
+        if mode == 'length':
             # Add length column based on sequence length
             filtered_reads_df['length'] = filtered_reads_df['seq'].str.len()
-            # Sort by length (descending) and take the first read
-            filtered_reads_df = filtered_reads_df.sort_values('length', ascending=False)
-        elif mode == 'prob_largest':
-            # Sort by prob_class_1 (descending) and take the first read
-            filtered_reads_df = filtered_reads_df.sort_values('prob_class_1', ascending=False)
+            # Sort by length (descending) and take the top 10 reads
+            filtered_reads_df = filtered_reads_df.sort_values('length', ascending=False).head(10)
+        elif mode == 'prob':
+            # Sort by prob_class_1 (descending) and take the top 10 reads
+            filtered_reads_df = filtered_reads_df.sort_values('prob_class_1', ascending=False).head(10)
         else:
             raise ValueError(f"Unknown mode: {mode}")
         
-        # Get the best read
+        # Process the top reads
         if not filtered_reads_df.empty:
-            best_read = filtered_reads_df.iloc[0]
+            results = []
             
-            # Calculate methylation statistics for this DMR, masking sites outside the read region
-            # Also include the read sequence for read-level methylation mapping
-            raw_dmr_level, prob_weighted_dmr_level, cpg_positions, raw_read_level, prob_weighted_read_level = calculate_methylation_stats(
-                filtered_methylation_df, 
-                read_start=best_read['start'],
-                read_end=best_read['end'],
-                read_seq=best_read['seq']
-            )
+            for _, read in filtered_reads_df.iterrows():
+                # Calculate methylation statistics for this DMR, masking sites outside the read region
+                # Also include the read sequence for read-level methylation mapping
+                raw_dmr_level, prob_weighted_dmr_level, cpg_positions, raw_read_level, prob_weighted_read_level = calculate_methylation_stats(
+                    filtered_methylation_df, 
+                    read_start=read['start'],
+                    read_end=read['end'],
+                    read_seq=read['seq']
+                )
+                
+                results.append({
+                    'dmr_index': dmr['dmr_index'],
+                    'read': {
+                        'name': read['name'],
+                        'seq': read['seq'],
+                        'prob_class_1': read['prob_class_1'],
+                        'chr_dmr': dmr['chr_dmr'],
+                        'start_dmr': dmr['start_dmr'],
+                        'end_dmr': dmr['end_dmr'],
+                        'start': read['start'],
+                        'end': read['end'],
+                        'chr': read['chr']
+                    },
+                    'methylation': {
+                        'raw_dmr_level': raw_dmr_level,
+                        'prob_weighted_dmr_level': prob_weighted_dmr_level,
+                        'raw_read_level': raw_read_level,
+                        'prob_weighted_read_level': prob_weighted_read_level,
+                        'cpg_positions': cpg_positions
+                    }
+                })
             
-            return {
-                'dmr_index': dmr['dmr_index'],
-                'read': {
-                    'name': best_read['name'],
-                    'seq': best_read['seq'],
-                    'prob_class_1': best_read['prob_class_1'],
-                    'chr_dmr': dmr['chr_dmr'],
-                    'start_dmr': dmr['start_dmr'],
-                    'end_dmr': dmr['end_dmr'],
-                    'start': best_read['start'],
-                    'end': best_read['end'],
-                    'chr': best_read['chr']
-                },
-                'methylation': {
-                    'raw_dmr_level': raw_dmr_level,
-                    'prob_weighted_dmr_level': prob_weighted_dmr_level,
-                    'raw_read_level': raw_read_level,
-                    'prob_weighted_read_level': prob_weighted_read_level,
-                    'cpg_positions': cpg_positions
-                }
-            }
+            return results
         
         return None
     
@@ -329,7 +332,7 @@ def extract_reads_parallel(max_coverage_df, dmr_reads_dict, dmr_methylation_dict
         max_coverage_df (pd.DataFrame): DataFrame with max coverage positions
         dmr_reads_dict (dict): Dictionary mapping DMR indices to filtered read data
         dmr_methylation_dict (dict): Dictionary mapping DMR indices to filtered methylation data
-        mode (str): Selection mode ('longest' or 'prob_largest')
+        mode (str): Selection mode ('length' or 'prob')
         num_processes (int): Number of processes to use
         
     Returns:
@@ -345,7 +348,7 @@ def extract_reads_parallel(max_coverage_df, dmr_reads_dict, dmr_methylation_dict
         
         process_data_list.append((dmr_row, filtered_reads_df, filtered_methylation_df))
     
-    console.print(f"[bold blue]Extracting reads using [/bold blue]{num_processes}[bold blue] processes...[/bold blue]")
+    console.print(f"[bold blue]Extracting top 10 reads using [/bold blue]{num_processes}[bold blue] processes...[/bold blue]")
     
     # Create a partial function with fixed parameters
     process_func = partial(process_dmr, mode=mode)
@@ -359,8 +362,14 @@ def extract_reads_parallel(max_coverage_df, dmr_reads_dict, dmr_methylation_dict
             unit="DMR"
         ))
     
-    # Filter out None results (failed DMRs)
-    selected_reads = [r for r in results if r is not None]
+    # Filter out None results (failed DMRs) and flatten the list of results
+    selected_reads = []
+    for result in results:
+        if result is not None:
+            if isinstance(result, list):
+                selected_reads.extend(result)
+            else:
+                selected_reads.append(result)
     
     return selected_reads
 
@@ -423,24 +432,24 @@ def write_tsv(selected_reads, output_file):
 @click.option('--input', required=True, help='Path to the input parquet file with read data')
 @click.option('--max_coverage', required=True, help='Path to the max coverage CSV file')
 @click.option('--methylation', required=True, help='Path to the methylation CSV file')
-@click.option('--mode', required=True, type=click.Choice(['longest', 'prob_largest']), 
-              help='Read selection mode: longest or prob_largest')
+@click.option('--mode', required=True, type=click.Choice(['length', 'prob']), 
+              help='Read selection mode: length (top 10 longest) or prob (top 10 highest probability)')
 @click.option('--prefix', required=True, help='Prefix for output files')
 @click.option('--ncpus', type=int, default=None, help='Number of processes to use (default: number of CPU cores)')
 @click.option('--chunk_size', type=int, default=1000000, help='Size of chunks to read from parquet file')
 @click.option('--verbose', is_flag=True, help='Print verbose output')
 def main(input, max_coverage, methylation, mode, prefix, ncpus, chunk_size, verbose):
     """
-    Extract reads from a parquet file based on maximum coverage positions.
+    Extract the top 10 reads from a parquet file based on maximum coverage positions.
     
     This script processes a parquet file containing read data, a max coverage
     file containing the positions with maximum coverage for each DMR, and a
-    methylation file with CpG methylation data. For each DMR, it selects one
-    read based on the specified selection mode and generates a TSV file with
+    methylation file with CpG methylation data. For each DMR, it selects the top
+    10 reads based on the specified selection mode and generates a TSV file with
     the selected reads and their methylation information.
     
-    The selection mode can be either 'longest' (select the longest read) or
-    'prob_largest' (select the read with the largest probability score).
+    The selection mode can be either 'length' (select the top 10 longest reads) or
+    'prob' (select the top 10 reads with the highest probability scores).
     """
     start_time = time.time()
     
@@ -469,7 +478,7 @@ def main(input, max_coverage, methylation, mode, prefix, ncpus, chunk_size, verb
             console.print(f"Created output directory: {output_dir}")
         
         console.print(Panel.fit(
-            f"[bold green]Extracting reads from:[/bold green] {input}\n"
+            f"[bold green]Extracting top 10 reads from:[/bold green] {input}\n"
             f"[bold green]Using max coverage positions from:[/bold green] {max_coverage}\n"
             f"[bold green]Using methylation data from:[/bold green] {methylation}\n"
             f"[bold green]Selection mode:[/bold green] {mode}\n"

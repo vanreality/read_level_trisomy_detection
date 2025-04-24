@@ -7,6 +7,7 @@ process SPLIT_PARQUET_BY_SAMPLE {
     
     output:
     tuple val(meta), path("samplesheet.csv"), emit: samplesheet
+    tuple val(meta), path("metadata.csv"), emit: metadata
     
     script:
     def args = task.ext.args ?: ''

@@ -261,6 +261,9 @@ def main(input, output, ncpus, verbose):
         # Expand wildcards if any and handle space-separated filenames
         input_files = []
         for pattern in input:
+            # Remove \ from the pattern
+            pattern = pattern.replace('\\', '')
+
             # Check if the pattern contains spaces (multiple filenames in one argument)
             if ' ' in pattern:
                 # Split by space and check if each individual file exists

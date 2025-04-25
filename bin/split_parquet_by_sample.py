@@ -20,7 +20,7 @@ def get_parquet_columns(input_file):
     """
     try:
         schema = pl.read_parquet_schema(input_file)
-        return schema.names()
+        return list(schema.keys())
     except Exception as e:
         raise ValueError(f"Error reading parquet schema: {e}")
 
